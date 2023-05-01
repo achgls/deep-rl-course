@@ -24,7 +24,7 @@ class QLearningAgent:
             eps_schedule="exponential",  # "linear"
             eps_decay_rate=0.0005,
             init="zeros",  # "normal"
-            seed=None,
+            seed=None,  # For now seed doesn't do anything, ideally it would
             init_sigma=None
     ):
         if eps_range is None:
@@ -47,7 +47,7 @@ class QLearningAgent:
 
         self.gamma = gamma
         if jitter_sigma is None:
-            self._jitter_Q_table = lambda: None
+            self._jitter_Q_table = lambda rng: None
         self.jitter_sigma = jitter_sigma
 
         assert eps_schedule in ("exponential", "linear")
@@ -83,8 +83,11 @@ class QLearningAgent:
     def _greedy_action(self, state):
         return np.argmax(self.Q_table[state])
 
-    def _random_action(self, state):
-        return np.random.randint(self.nA)
+    def _random_action(self, rng):
+        if rng is not None:
+            return rng.randint(self.nA)
+        else:
+            return np.random.randint(self.nA)
 
     def _epsilon_greedy_action(self, state):
         if np.random.uniform(0, 1) < self.epsilon:
@@ -100,19 +103,26 @@ class QLearningAgent:
         # Perform update
         self.Q_table[state, action] += self.lr * (td_target - self.Q_table[state, action])
 
-    def _train_one_episode(self, seed=None):
-        eps_probs = np.random.uniform(0, 1, size=self.max_timesteps)
-        policies = [self._greedy_action if p > self.epsilon else self._random_action for p in eps_probs]
-        obs = self.env.reset(seed=seed)[0]
+    def _train_one_episode(self, seed=None, rng=None):
+        if rng is not None:
+            eps_probs = rng.uniform(0, 1, size=self.max_timesteps)
+        else:
+            eps_probs = np.random.uniform(0, 1, size=self.max_timesteps)
 
-        action = policies[0](obs)
-        new_obs, reward, end, _, _ = self.env.step(action)  # Care to
+        greedy_action = lambda obs, rng: self._greedy_action(obs)
+        random_action = lambda obs, rng: self._random_action(rng)
+
+        policies = [greedy_action if p > self.epsilon else random_action for p in eps_probs]
+        obs = self.env.reset(seed=int(seed % self.nS))[0]
+
+        action = policies[0](obs, rng)
+        new_obs, reward, end, _, _ = self.env.step(action)
         self._update_Q_table(obs, action, reward, new_obs)
         obs = new_obs
         timesteps = 1
 
         while not end and timesteps < self.max_timesteps:
-            action = policies[timesteps](obs)
+            action = policies[timesteps](obs, rng)
             new_obs, reward, end, _, _ = self.env.step(action)
             self._update_Q_table(obs, action, reward, new_obs)
             obs = new_obs
@@ -120,8 +130,11 @@ class QLearningAgent:
 
         return timesteps
 
-    def _jitter_Q_table(self):
-        self.Q_table += np.random.randn(*self.Q_table.shape) * self.jitter_sigma
+    def _jitter_Q_table(self, rng=None):
+        if rng is not None:
+            self.Q_table += rng.randn(*self.Q_table.shape) * self.jitter_sigma
+        else:
+            self.Q_table += np.random.randn(*self.Q_table.shape) * self.jitter_sigma
 
     def get_Q_table(self):
         return self.Q_table
@@ -129,17 +142,39 @@ class QLearningAgent:
     def get_checkpoints_keys(self):
         return list(self.checkpoints.keys())
 
-    def train(self, num_episodes, episodes_per_checkpoint=100, resume=False):
+    def train(self, num_episodes, episodes_per_checkpoint=100, resume=False, seed=None):
+        """
+        Trains the Q-Learning agent in the specified environement for a total of `num_episodes` episodes.
+
+        :param num_episodes: total number of episodes to train the agent for
+        :param episodes_per_checkpoint: number of episodes between each checkpoint (save)
+        :param resume: whether to resume from last checkpoint or start anew and clear all existing training
+        :param seed: Sets the seed for training (for starting environment, epsilon sampling, anq Q-table jittering)
+        :return:
+        """
         if not resume:
             self.total_timesteps = 0
             self.Q_table = self._initialize_Q_table()
             self.checkpoints = {}
             self.training_episodes = 0
+            self.epsilon = self.max_eps
+
+        if seed:
+            assert isinstance(seed, int), "Seed must be integer-valued"
+            rng = np.random.RandomState(seed)
+            seeds = rng.randint(0, 2_147_483_648, size=num_episodes)
+            fetch_seed = lambda k: seeds[k]
+            make_rng = lambda s: np.random.RandomState(s)
+        else:
+            fetch_seed = lambda k: None
+            make_rng = lambda s: None
 
         for ep in tqdm(range(num_episodes)):
-            self._jitter_Q_table()
+            ep_seed = fetch_seed(ep)  # can be None
+            rng = make_rng(ep_seed)  # can be None
+            self._jitter_Q_table(rng=rng)
             self.update_eps()
-            self.total_timesteps += self._train_one_episode()
+            self.total_timesteps += self._train_one_episode(seed=ep_seed, rng=rng)
             self.training_episodes += 1
 
             if ep and ep % episodes_per_checkpoint == 0:
@@ -164,7 +199,7 @@ class QLearningAgent:
 
     def _infer_one_episode(self, seed=None):
         if seed:
-            obs = self.env.reset(seed=seed)[0]
+            obs = self.env.reset(seed=int(seed % self.nS))[0]
         else:
             obs = self.env.reset()[0]
 
@@ -183,7 +218,18 @@ class QLearningAgent:
 
         return reward
 
-    def evaluate_agent(self, n_eval_episodes, cp=None, seed=None):
+    def evaluate_agent(self, n_eval_episodes, cp=None, seed=None, ep_seeds=None):
+        """
+        Evaluate an agent across `n_eval_episodes` episodes according to a specified seed and a specific checkpoint
+        key, if specified. Otherwise, will evaluate the agent according to its current Q-Table state.
+        Checkpoint keys can be retrieved with the `get_checkpoint_keys()` method.
+
+        :param n_eval_episodes:
+        :param cp:
+        :param seed:
+        :param ep_seeds:
+        :return:
+        """
         ep_rewards = np.empty(n_eval_episodes)
         if cp:
             assert isinstance(cp, str), "'cp' must be a string"
@@ -191,11 +237,19 @@ class QLearningAgent:
                 self.Q_table = self.checkpoints[cp]
             except KeyError:
                 print(f"Checkpoint {cp} not found.")
-        if seed is None:
-            seed = [None] * n_eval_episodes
+
+        assert ((ep_seeds is None) or (seed is None)), "seed and ep_seeds can't be mutually specified"
+
+        if seed:
+            rng = np.random.RandomState(seed)
+            evaluation_seeds = rng.randint(0, 2_147_483_648, size=n_eval_episodes)
+        elif ep_seeds:
+            evaluation_seeds = ep_seeds
+        else:
+            evaluation_seeds = [None] * n_eval_episodes
 
         for ep in range(n_eval_episodes):
-            ep_rewards[ep] = self._infer_one_episode(seed=seed[ep])
+            ep_rewards[ep] = self._infer_one_episode(seed=evaluation_seeds[ep])
 
         mean_reward = np.mean(ep_rewards)
         std_reward = np.std(ep_rewards)
