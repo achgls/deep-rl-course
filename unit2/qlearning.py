@@ -279,7 +279,7 @@ class QLearningAgent:
         }
         return model
 
-    def record_video(self, out_dir, fps, cp=None):
+    def record_video(self, out_path, fps, cp=None):
         """
         Generate a replay video of the agent
         :param out_dir=
@@ -297,14 +297,16 @@ class QLearningAgent:
         state = self.env.reset(seed=np.random.randint(0, 500))[0]
         img = self.env.render()
         images.append(img)
-        while not done:
+        timesteps = 0
+        while not done and timesteps < self.max_timesteps:
             # Take the action (index) that have the maximum expected future reward given that state
             action = self._greedy_action(state)
             state, reward, done, _, info = self.env.step(
                 action)  # We directly put next_state = state for recording logic
             img = self.env.render()
             images.append(img)
-        imageio.mimsave(out_dir, [np.array(img) for i, img in enumerate(images)], fps=fps)
+            timesteps += 1
+        imageio.mimsave(out_path, [np.array(img) for i, img in enumerate(images)], fps=fps)
 
     def find_best_cp(self, n_eval_episodes, eval_seed):
         """
@@ -485,10 +487,13 @@ class QLearningTaxi(QLearningAgent):
         sorted_values = np.argsort(self.Q_table[state])[::-1]
         return sorted_values[np.isin(sorted_values, valid_actions)][0]
 
-    def _random_valid_action(self, state, action_mask):
+    def _random_valid_action(self, rng, action_mask):
         # Overrides random action for valid actions
         valid_actions = np.where(action_mask == 1)[0]
-        return np.random.choice(valid_actions)
+        if rng is not None:
+            return rng.choice(valid_actions)
+        else:
+            return np.random.choice(valid_actions)
 
     def _epsilon_greedy_valid_action(self, state, action_mask):
         if np.random.uniform(0, 1) < self.epsilon:
@@ -497,13 +502,20 @@ class QLearningTaxi(QLearningAgent):
             action = self._greedy_valid_action(state, action_mask)
         return action
 
-    def _train_one_episode(self, seed=None):
-        eps_probs = np.random.uniform(0, 1, size=self.max_timesteps)
-        policies = [self._greedy_valid_action if p > self.epsilon else self._random_valid_action for p in eps_probs]
-        obs, info = self.env.reset(seed=seed)
+    def _train_one_episode(self, seed=None, rng=None):
+        if rng is not None:
+            eps_probs = rng.uniform(0, 1, size=self.max_timesteps)
+        else:
+            eps_probs = np.random.uniform(0, 1, size=self.max_timesteps)
+
+        greedy_action = lambda s, r, a: self._greedy_valid_action(s, a)
+        random_action = lambda s, r, a: self._random_valid_action(r, a)
+
+        policies = [greedy_action if p > self.epsilon else random_action for p in eps_probs]
+        obs, info = self.env.reset(seed=int(seed % self.nS))
         action_mask = info["action_mask"]
 
-        action = policies[0](obs, action_mask)
+        action = policies[0](obs, rng, action_mask)
         new_obs, reward, end, _, info = self.env.step(action)
         action_mask = info["action_mask"]
         self._update_Q_table(obs, action, reward, new_obs)
@@ -511,7 +523,7 @@ class QLearningTaxi(QLearningAgent):
         timesteps = 1
 
         while not end and timesteps < self.max_timesteps:
-            action = policies[timesteps](obs, action_mask)
+            action = policies[timesteps](obs, rng, action_mask)
             new_obs, reward, end, _, info = self.env.step(action)
             action_mask = info["action_mask"]
             self._update_Q_table(obs, action, reward, new_obs)
@@ -521,7 +533,11 @@ class QLearningTaxi(QLearningAgent):
         return timesteps
 
     def _infer_one_episode(self, seed=None):
-        obs, info = self.env.reset(seed=seed)
+        if seed:
+            obs, info = self.env.reset(seed=int(seed % self.nS))
+        else:
+            obs, info = self.env.reset()
+
         action_mask = info["action_mask"]
 
         reward = 0
@@ -540,5 +556,3 @@ class QLearningTaxi(QLearningAgent):
             timesteps += 1
 
         return reward
-
-
