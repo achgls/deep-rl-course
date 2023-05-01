@@ -1,14 +1,16 @@
+import datetime
+import json
+import pickle
+from pathlib import Path
+
 import gym
+import imageio
 import numpy as np
 from gym import Env
-from tqdm.notebook import tqdm
-import imageio
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.repocard import metadata_eval_result, metadata_save
-import datetime
-import pickle
-import json
-from pathlib import Path
+from tqdm.notebook import tqdm
+
 
 class QLearningAgent:
     def __init__(
@@ -20,7 +22,7 @@ class QLearningAgent:
             jitter_sigma=0.005,
             eps_range=None,
             eps_schedule="exponential",  # "linear"
-            eps_decay_rate = 0.0005,
+            eps_decay_rate=0.0005,
             init="zeros",  # "normal"
             seed=None,
             init_sigma=None
@@ -46,8 +48,7 @@ class QLearningAgent:
         self.gamma = gamma
         if jitter_sigma is None:
             self._jitter_Q_table = lambda: None
-        else:
-            self.jitter_sigma = jitter_sigma
+        self.jitter_sigma = jitter_sigma
 
         assert eps_schedule in ("exponential", "linear")
         self.eps_decay_schedule = eps_schedule
@@ -64,7 +65,7 @@ class QLearningAgent:
         self.total_timesteps = 0
         self.training_episodes = 0
         self.Q_table = self._initialize_Q_table()
-        self.checkpoints = {}  # Q-table checkpoints
+        self.checkpoints = dict()  # Q-table checkpoints
 
     def _exponential_schedule(self):
         self.epsilon = max(self.min_eps, self.epsilon * (1 - self.eps_decay_rate))
@@ -77,15 +78,17 @@ class QLearningAgent:
         if self.init_mode == "zeros":
             return np.zeros(q_table_shape, dtype=np.float32)
         elif self.init_mode == "random":
-            return np.random.randn(q_table_shape) * self.sigma
+            return np.random.randn(q_table_shape) * self.init_sigma
 
     def _greedy_action(self, state):
         return np.argmax(self.Q_table[state])
 
+    def _random_action(self, state):
+        return np.random.randint(self.nA)
+
     def _epsilon_greedy_action(self, state):
         if np.random.uniform(0, 1) < self.epsilon:
-            # take random action
-            action = np.random.randint(self.nA)
+            action = self._random_action(state)
         else:
             action = self._greedy_action(state)
         return action
@@ -99,7 +102,7 @@ class QLearningAgent:
 
     def _train_one_episode(self, seed=None):
         eps_probs = np.random.uniform(0, 1, size=self.max_timesteps)
-        policies = [self._greedy_action if p > self.epsilon else self._epsilon_greedy_action for p in eps_probs]
+        policies = [self._greedy_action if p > self.epsilon else self._random_action for p in eps_probs]
         obs = self.env.reset(seed=seed)[0]
 
         action = policies[0](obs)
@@ -237,13 +240,14 @@ class QLearningAgent:
                 print(f"Checkpoint {cp} not found.")
         images = []
         done = False
-        state = self.env.reset(seed=np.random.randint(0, 500))
+        state = self.env.reset(seed=np.random.randint(0, 500))[0]
         img = self.env.render()
         images.append(img)
         while not done:
             # Take the action (index) that have the maximum expected future reward given that state
             action = self._greedy_action(state)
-            state, reward, done, _, info = self.env.step(action)  # We directly put next_state = state for recording logic
+            state, reward, done, _, info = self.env.step(
+                action)  # We directly put next_state = state for recording logic
             img = self.env.render()
             images.append(img)
         imageio.mimsave(out_dir, [np.array(img) for i, img in enumerate(images)], fps=fps)
@@ -265,7 +269,7 @@ class QLearningAgent:
                 cp=cp
             )
             score = mean_reward - std_reward
-            if score < best_score:
+            if score > best_score:
                 best_score = score
                 best_cp = cp
 
@@ -289,6 +293,8 @@ class QLearningAgent:
         - It pushes everything to the Hub
 
         :param repo_id: repo_id: id of the model repository from the Hugging Face Hub
+        :param n_eval_episodes: number of evaluation episodes
+        :param eval_seed: evaluation seed for the evaluation episodes
         :param video_fps: how many frame per seconds to record our video replay
         (with taxi-v3 and frozenlake-v1 we use 1)
         :param local_repo_path: where the local repository is
@@ -351,8 +357,9 @@ class QLearningAgent:
         if self.env.spec.kwargs.get("map_name"):
             env_name += "-" + self.env.spec.kwargs.get("map_name")
 
-        if not self.env.spec.kwargs.get("is_slippery", ""):
-            env_name += "-" + "no_slippery"
+        if "FrozenLake" in env_name:
+            if not self.env.spec.kwargs.get("is_slippery", ""):
+                env_name += "-" + "no_slippery"
 
         metadata = dict()
         metadata["tags"] = [env_name, "q-learning", "reinforcement-learning", "custom-implementation"]
@@ -373,8 +380,8 @@ class QLearningAgent:
         metadata = {**metadata, **eval_results}
 
         model_card = f"""
-      # **Q-Learning** Agent playing1 **{metadata["env_id"]}**
-      This is a trained model of a **Q-Learning** agent playing **{metadata["env_id"]}** .
+      # **Q-Learning** Agent playing1 **{model["env_id"]}**
+      This is a trained model of a **Q-Learning** agent playing **{model["env_id"]}** .
 
       ## Usage
 
@@ -386,8 +393,6 @@ class QLearningAgent:
       env = gym.make(model["env_id"])
       ```
       """
-
-        #evaluate_agent(env, model["max_steps"], model["n_eval_episodes"], model["qtable"], model["eval_seed"])
 
         readme_path = repo_local_path / "README.md"
         readme = ""
@@ -414,5 +419,72 @@ class QLearningAgent:
             folder_path=repo_local_path,
             path_in_repo=".",
         )
+
+
+class QLearningTaxi(QLearningAgent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def _greedy_valid_action(self, state, action_mask):
+        # Overrides greedy action for valid greedy action
+        valid_actions = np.where(action_mask == 1)[0]
+        sorted_values = np.argsort(self.Q_table[state])[::-1]
+        return sorted_values[np.isin(sorted_values, valid_actions)][0]
+
+    def _random_valid_action(self, state, action_mask):
+        # Overrides random action for valid actions
+        valid_actions = np.where(action_mask == 1)[0]
+        return np.random.choice(valid_actions)
+
+    def _epsilon_greedy_valid_action(self, state, action_mask):
+        if np.random.uniform(0, 1) < self.epsilon:
+            action = self._random_valid_action(state, action_mask)
+        else:
+            action = self._greedy_valid_action(state, action_mask)
+        return action
+
+    def _train_one_episode(self, seed=None):
+        eps_probs = np.random.uniform(0, 1, size=self.max_timesteps)
+        policies = [self._greedy_valid_action if p > self.epsilon else self._random_valid_action for p in eps_probs]
+        obs, info = self.env.reset(seed=seed)
+        action_mask = info["action_mask"]
+
+        action = policies[0](obs, action_mask)
+        new_obs, reward, end, _, info = self.env.step(action)
+        action_mask = info["action_mask"]
+        self._update_Q_table(obs, action, reward, new_obs)
+        obs = new_obs
+        timesteps = 1
+
+        while not end and timesteps < self.max_timesteps:
+            action = policies[timesteps](obs, action_mask)
+            new_obs, reward, end, _, info = self.env.step(action)
+            action_mask = info["action_mask"]
+            self._update_Q_table(obs, action, reward, new_obs)
+            obs = new_obs
+            timesteps += 1
+
+        return timesteps
+
+    def _infer_one_episode(self, seed=None):
+        obs, info = self.env.reset(seed=seed)
+        action_mask = info["action_mask"]
+
+        reward = 0
+
+        action = self._greedy_valid_action(obs, action_mask)
+        obs, r, end, _, info = self.env.step(action)
+        action_mask = info["action_mask"]
+        reward += r
+        timesteps = 1
+
+        while not end and timesteps < self.max_timesteps:
+            action = self._greedy_valid_action(obs, action_mask)
+            obs, r, end, _, info = self.env.step(action)
+            action_mask = info["action_mask"]
+            reward += r
+            timesteps += 1
+
+        return reward
 
 
