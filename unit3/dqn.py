@@ -17,13 +17,24 @@ __cnn_default_kwargs__ = {
     "pooling": "GAP",
     "hidden_fc_units": [],
     "fc_dropout": [0.2],
-    "out_bias": True
+    "out_bias": True,
+    "activation": "relu",
+    "padding": "same",
+    "padding_mode": "replicate"
 }
 
 __mlp_default_kwargs__ = {
     "layers": [256, 128, 128],
     "dropout": [0.4, 0.25, 0.25],
-    "out_bias": True
+    "out_bias": True,
+    "activation": "relu"
+}
+
+__activation_dict__ = {
+    "relu": torch.nn.ReLU,
+    "ReLU": torch.nn.ReLU,
+    "sigmoid": torch.nn.Sigmoid,
+    "tanh": torch.nn.Tanh
 }
 
 
@@ -178,6 +189,7 @@ class DQN:
             train_freq: int = 4,
             gradient_steps: int = 1,
             target_update_interval: int = 10000,
+            replay_buffer_size: int = 1_000,
             exploration_fraction=0.1,
             exploration_initial_eps=1.0,
             exploration_final_eps=0.05,
@@ -195,12 +207,6 @@ class DQN:
             tensorboard_log=None,
             policy_kwargs=None,
             verbose=0,
-            _init_setup_model=True,
-
-            # Idk what these do
-            replay_buffer_class = None,
-            replay_buffer_kwargs = None,
-            optimize_memory_usage = False,
     ):
         # --- Register environment ---
         self._register_environment(env)
@@ -212,8 +218,7 @@ class DQN:
         self._register_device(device)
 
         # --- Initialize model ---
-        if _init_setup_model:
-            self._initialize_q_nets()
+        self._initialize_q_nets()
 
         # --- Initialize optimizer ---
         self._initialize_optimizer()
@@ -222,7 +227,7 @@ class DQN:
         self.gamma = gamma  # discount factor
 
         # --- DQN-specific hyperparameters ---
-        self.replay_buffer_size = buffer_size  # N in the pseudocode
+        self.replay_buffer = ReplayBuffer(replay_buffer_size, observation_shape=self.obs_shape)
         self.train_freq = train_freq
         self.learning_starts = learning_starts
         self.target_update_interval = target_update_interval  # C in the pseudocode
@@ -243,6 +248,11 @@ class DQN:
         self._initialize_tensorboard()
 
     def _check_policy(self, policy, policy_kwargs):
+        # ADD SUPPORT FOR CUSTOM CNN / MLP POLICIES LATER
+        if policy_kwargs:
+            raise NotImplementedError("Support for custom CNN and MLP policies is not supported yet")
+
+        assert not (policy and policy_kwargs), "If policy module is provided, policy_kwargs must be None"
         assert policy in ("CnnPolicy", "MlpPolicy") or isinstance(policy, nn.Module), \
             "Policy must be 'CnnPolicy', 'MlpPolicy' or an instance of nn.Module (a PyTorch neural network)"
         if isinstance(policy, nn.Module):
@@ -257,20 +267,24 @@ class DQN:
             assert output.ndim == 1 and output.size(0) == self.n_actions, \
                 "The output of the given policy has to be 1-d, with length equal to the number of possible actions"
 
-        elif policy == "CnnPolicy":
-            if policy_kwargs is not None:
-                # Check that the policy kwargs work
-                ...
-            else:
-                # Initialize default CnnPolicy kwargs
-                policy_kwargs = __cnn_default_kwargs__
         else:
+            default_kwargs = __cnn_default_kwargs__ if policy == "CnnPolicy" else __mlp_default_kwargs__
             if policy_kwargs is not None:
                 # Check that the policy kwargs work
+                if any(key not in default_kwargs.keys() for key in policy_kwargs.keys()):
+                    keys = set(policy_kwargs.keys()) - set(default_kwargs)
+                    raise KeyError(
+                        f"Argument{'s' if len(keys>1) else ''}"
+                        f"{', '.join(key for key in keys)} not recognized for CnnPolicy keyword arguments")
+            else:
+                policy_kwargs = default_kwargs
+
+            if policy == "CnnPolicy":
+                # Assert that given parameters work and merge with default parameters if needed
                 ...
             else:
-                # Initialize default MlpPolicy kwargs
-                policy_kwargs = __mlp_default_kwargs__
+                # Assert that given parameters work and merge with default parameters if needed
+                ...
 
     def _register_environment(self, env):
         # Check compatibility and so on
@@ -299,9 +313,6 @@ class DQN:
         else:
             self.device = torch.device(device)
 
-    def _initialize_replay_buffer(self):
-        ...
-
     def _get_eps_scheduler(self, n_training_steps):
         """
         Returns the epsilon scheduling action to be used during training. Called at the beginning of training, when
@@ -312,17 +323,88 @@ class DQN:
         """
         n_eps_scheduling_steps = round(n_training_steps * self.exploration_fraction)
         if self.eps_schedule_type == "exponential":
-            decay_rate = ...
+            decay_rate = (self.final_eps / self.initial_eps) ** (1 / n_training_steps)
             return lambda k: max(self.initial_eps * (decay_rate ** k), self.final_eps)
         else:
             slope = (self.initial_eps - self.final_eps) / n_eps_scheduling_steps
             return lambda k: max(self.initial_eps - k * slope, self.final_eps)
 
-    def _initialize_q_nets(self, seed=None):
-        ...
+    def _initialize_q_nets(self, policy, policy_kwargs, seed=None):
+        if isinstance(policy, torch.nn.Module):
+            q_net = self.policy.__class__(**policy_kwargs)
+            q_target_net = self.policy.__class__(**policy_kwargs)
+            return q_net, q_target_net
+
+        elif policy == "CnnPolicy":
+            kernels = policy_kwargs["kernel_sizes"]
+            filters = policy_kwargs["filters"]
+            dropout = policy_kwargs["dropout"]
+            padding = policy_kwargs["padding"]
+            padding_mode = policy_kwargs["padding_mode"]
+            activation_module = __activation_dict__[policy_kwargs["activation"]]
+            pooling_module = torch.nn.AdaptiveAvgPool2d((1, 1)) \
+                if policy_kwargs["pooling"] in ("gap", "GAP") \
+                else torch.nn.Flatten()
+
+            layers = []
+            prev_depth = self.obs_shape[-1]
+            for out, size, drop in zip(filters, kernels, dropout):
+                layers.append(
+                    torch.nn.Conv2d(
+                        in_channels=prev_depth,
+                        out_channels=out,
+                        kernel_size=size,
+                        padding=padding,
+                        padding_mode=padding_mode,
+                        bias=False))
+                if drop:
+                    layers.append(torch.nn.Dropout(p=drop))
+                layers.append(activation_module())
+                layers.append(torch.nn.MaxPool2d(kernel_size=2, stride=2))
+            layers.append(pooling_module)
+
+            fc_units = policy_kwargs["hidden_fc_units"]
+            fc_dropout = policy_kwargs["fc_dropout"]
+
+            prev_len = out
+            for out, drop in zip(fc_units, fc_dropout):
+                layers.append(
+                    torch.nn.Linear(
+                        in_features=prev_len,
+                        out_features=out))
+                if drop:
+                    layers.append(torch.nn.Dropout(p=drop))
+                layers.append(activation_module())
+                prev_len = out
+
+            layers.append(torch.nn.Flatten())
+
+        else:
+            units = policy_kwargs["layers"]
+            dropout = policy_kwargs["dropout"]
+            activation_module = __activation_dict__[policy_kwargs["activation"]]
+
+            layers = []
+            if len(self.obs_shape) != 1:
+                layers.append(torch.nn.Flatten())
+            prev_len = self.obs_shape.numel()
+            for out, drop in zip(units, dropout):
+                layers.append(torch.nn.Linear(prev_len, out))
+                if drop:
+                    layers.append(torch.nn.Dropout(p=drop))
+                layers.append(activation_module())
+                prev_len = out
+
+        layers.append(torch.nn.Linear(prev_len, out_features=self.n_actions, bias=policy_kwargs["out_bias"]))
+        # Probability-interpretable outputs for stochastic decisions
+        layers.append(torch.nn.Softmax(dim=1))
+
+        q_net = torch.nn.Sequential(*layers)
+        q_target_net = torch.nn.Sequential(*layers)
+        return q_net, q_target_net
 
     def _update_q_target_net(self):
-        ...
+        self.q_target_net.load_state_dict(self.q_net.state_dict())
 
     def set_scheduler_params(self, initial_eps, final_eps, exploration_frac):
         self.initial_eps = initial_eps
@@ -330,10 +412,10 @@ class DQN:
         self.exploration_fraction = exploration_frac
 
     def set_DQN_hyperparameters(self, replay_buffer_size, train_freq, learning_starts, target_update_interval):
-        self.replay_buffer_size = replay_buffer_size
+        self.replay_buffer = ReplayBuffer(replay_buffer_size, observation_shape=self.obs_shape)
         self.train_freq = train_freq
         self.learning_starts = learning_starts
-        self.target_update_interval = target_update_interval
+        self.target_update_interval = target_update_interval  # C in the pseudocode
 
     def set_discount_rate(self, gamma):
         self.gamma = gamma
@@ -342,9 +424,9 @@ class DQN:
         ...
 
     def train(self, training_steps):
-        for _ in range(training_steps):
+        for trn_step in range(training_steps):
             # Sample from memory buffer
-            self.sample_from_memory_buffer(size=self.batch_size)
+            batch = self.replay_buffer.sample(self.batch_size)
             # Compute Q-Values and Q-Targets
             with torch.no_grad():
                 q_values = ...
